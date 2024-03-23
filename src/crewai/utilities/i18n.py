@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_valid
 class I18N(BaseModel):
     _translations: Dict[str, Dict[str, str]] = PrivateAttr()
     language: Optional[str] = Field(
-        default="en",
+        default = os.environ.get("DEFAULT_LANGUAGE", "en"),
         description="Language used to load translations",
     )
 
@@ -41,8 +41,8 @@ class I18N(BaseModel):
     def errors(self, error: str) -> str:
         return self.retrieve("errors", error)
 
-    def tools(self, error: str) -> str:
-        return self.retrieve("tools", error)
+    def tools(self, tool: str) -> str:
+        return self.retrieve("tools", tool)
 
     def retrieve(self, kind, key) -> str:
         try:
