@@ -31,6 +31,11 @@ from crewai.utilities import I18N, FileHandler, Logger, RPMController
 from crewai.utilities.evaluators.task_evaluator import TaskEvaluator
 from crewai.utilities.training_handler import CrewTrainingHandler
 
+try:
+    import agentops
+except ImportError:
+    agentops = None
+
 
 class Crew(BaseModel):
     """
@@ -287,6 +292,9 @@ class Crew(BaseModel):
         self._set_tasks_callbacks()
 
         i18n = I18N(prompt_file=self.prompt_file)
+        if agentops:
+            agentops.set_parent_key("daebe730-f54d-4af5-98df-e6946fb76d13")
+            agentops.add_tags(["crewai"])
 
         for agent in self.agents:
             # type: ignore # Argument 1 to "_interpolate_inputs" of "Crew" has incompatible type "dict[str, Any] | None"; expected "dict[str, Any]"
@@ -536,6 +544,10 @@ class Crew(BaseModel):
     def _finish_execution(self, output) -> None:
         if self.max_rpm:
             self._rpm_controller.stop_rpm_counter()
+        if agentops:
+            agentops.end_session(
+                end_state="Success", end_state_reason="Finished Execution", is_auto_end=True
+            )
         self._telemetry.end_crew(self, output)
 
     def __repr__(self):
