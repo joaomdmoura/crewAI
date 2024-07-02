@@ -48,6 +48,8 @@ class Telemetry:
         self.ready = False
         self.trace_set = False
         try:
+            if os.environ.get("CREWAI_TELEMETRY_OPT_OUT", False):
+                return
             telemetry_endpoint = "https://telemetry.crewai.com:4319"
             self.resource = Resource(
                 attributes={SERVICE_NAME: "crewAI-telemetry"},
