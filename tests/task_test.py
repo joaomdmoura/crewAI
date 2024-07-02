@@ -80,7 +80,7 @@ def test_task_prompt_includes_expected_output():
 
     with patch.object(Agent, "execute_task") as execute:
         execute.return_value = "ok"
-        task.execute()
+        task.execute_sync()
         execute.assert_called_once_with(task=task, context=None, tools=[])
 
 
@@ -103,7 +103,7 @@ def test_task_callback():
 
     with patch.object(Agent, "execute_task") as execute:
         execute.return_value = "ok"
-        task.execute()
+        task.execute_sync()
         task_completed.assert_called_once_with(task.output)
 
 
@@ -126,7 +126,7 @@ def test_task_callback_returns_task_ouput():
 
     with patch.object(Agent, "execute_task") as execute:
         execute.return_value = "exported_ok"
-        task.execute()
+        task.execute_sync()
         # Ensure the callback is called with a TaskOutput object serialized to JSON
         task_completed.assert_called_once()
         callback_data = task_completed.call_args[0][0]
@@ -161,7 +161,7 @@ def test_execute_with_agent():
     )
 
     with patch.object(Agent, "execute_task", return_value="ok") as execute:
-        task.execute(agent=researcher)
+        task.execute_sync(agent=researcher)
         execute.assert_called_once_with(task=task, context=None, tools=[])
 
 
@@ -181,7 +181,7 @@ def test_async_execution():
     )
 
     with patch.object(Agent, "execute_task", return_value="ok") as execute:
-        task.execute(agent=researcher)
+        task.execute_async(agent=researcher)
         execute.assert_called_once_with(task=task, context=None, tools=[])
 
 
@@ -525,3 +525,14 @@ def test_interpolate_inputs():
         == "Give me a list of 5 interesting ideas about ML to explore for an article, what makes them unique and interesting."
     )
     assert task.expected_output == "Bullet point list of 5 interesting ideas about ML."
+
+
+"""
+TODO: TEST SYNC
+- Verify return type
+"""
+
+"""
+TODO: TEST ASYNC
+- Verify return type
+"""

@@ -2,8 +2,9 @@ import os
 import re
 import threading
 import uuid
-from copy import deepcopy
-from typing import Any, Dict, List, Optional, Type
+from concurrent.futures import Future
+from copy import copy, deepcopy
+from typing import Any, Dict, List, Optional, Type, Union
 
 from langchain_openai import ChatOpenAI
 from opentelemetry.trace import Span
@@ -13,7 +14,9 @@ from pydantic_core import PydanticCustomError
 from crewai.agents.agent_builder.base_agent import BaseAgent
 from crewai.tasks.task_output import TaskOutput
 from crewai.telemetry.telemetry import Telemetry
-from crewai.utilities import I18N, ConverterError, Printer
+from crewai.utilities.converter import Converter, ConverterError
+from crewai.utilities.i18n import I18N
+from crewai.utilities.printer import Printer
 from crewai.utilities.pydantic_schema_parser import PydanticSchemaParser
 
 
@@ -155,30 +158,46 @@ class Task(BaseModel):
             )
         return self
 
-    def wait_for_completion(self) -> str | BaseModel:
-        """Wait for asynchronous task completion and return the output."""
-        assert self.async_execution, "Task is not set to be executed asynchronously."
+    def execute_sync(
+        self,
+        agent: Optional[BaseAgent] = None,
+        context: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
+    ) -> TaskOutput:
+        """Execute the task synchronously."""
+        return self._execute_core(agent, context, tools)
 
-        if self._thread:
-            self._thread.join()
-            self._thread = None
-
-        assert self.output, "Task output is not set."
-
-        return self.output.exported_output
-
-    def execute(  # type: ignore # Missing return statement
+    def execute_async(
         self,
         agent: BaseAgent | None = None,
         context: Optional[str] = None,
         tools: Optional[List[Any]] = None,
-    ) -> str:
-        """Execute the task.
+    ) -> Future[TaskOutput]:
+        """Execute the task asynchronously."""
+        future = Future()
+        threading.Thread(
+            target=self._execute_task_async, args=(agent, context, tools, future)
+        ).start()
+        return future
 
-        Returns:
-            Output of the task.
-        """
+    def _execute_task_async(
+        self,
+        agent: Optional[BaseAgent],
+        context: Optional[str],
+        tools: Optional[List[Any]],
+        future: Future[TaskOutput],
+    ) -> None:
+        """Execute the task asynchronously with context handling."""
+        result = self._execute_core(agent, context, tools)
+        future.set_result(result)
 
+    def _execute_core(
+        self,
+        agent: Optional[BaseAgent],
+        context: Optional[str],
+        tools: Optional[List[Any]],
+    ) -> TaskOutput:
+        """Run the core execution logic of the task."""
         self._execution_span = self._telemetry.task_started(self)
 
         agent = agent or self.agent
@@ -188,49 +207,32 @@ class Task(BaseModel):
             )
 
         if self.context:
-            # type: ignore # Incompatible types in assignment (expression has type "list[Never]", variable has type "str | None")
-            context = []
+            context_list = []
             for task in self.context:
-                if task.async_execution:
-                    task.wait_for_completion()
-                if task.output:
-                    # type: ignore # Item "str" of "str | None" has no attribute "append"
-                    context.append(task.output.raw_output)
-            # type: ignore # Argument 1 to "join" of "str" has incompatible type "str | None"; expected "Iterable[str]"
-            context = "\n".join(context)
+                if task.async_execution and task.thread:
+                    task.thread.join()
+                if task and task.output:
+                    context_list.append(task.output.raw_output)
+            context = "\n".join(context_list)
 
         self.prompt_context = context
         tools = tools or self.tools
 
-        if self.async_execution:
-            self._thread = threading.Thread(
-                target=self._execute, args=(agent, self, context, tools)
-            )
-            self._thread.start()
-        else:
-            result = self._execute(
-                task=self,
-                agent=agent,
-                context=context,
-                tools=tools,
-            )
-            return result
-
-    def _execute(self, agent, task, context, tools):
         result = agent.execute_task(
-            task=task,
+            task=self,
             context=context,
             tools=tools,
         )
         exported_output = self._export_output(result)
 
-        # type: ignore # the responses are usually str but need to figure out a more elegant solution here
-        self.output = TaskOutput(
+        task_output = TaskOutput(
             description=self.description,
-            exported_output=exported_output,
             raw_output=result,
+            pydantic_output=exported_output["pydantic"],
+            json_output=exported_output["json"],
             agent=agent.role,
         )
+        self.output = task_output
 
         if self.callback:
             self.callback(self.output)
@@ -239,7 +241,7 @@ class Task(BaseModel):
             self._telemetry.task_ended(self._execution_span, self)
             self._execution_span = None
 
-        return exported_output
+        return task_output
 
     def prompt(self) -> str:
         """Prompt the task.
@@ -274,7 +276,7 @@ class Task(BaseModel):
         """Increment the delegations counter."""
         self.delegations += 1
 
-    def copy(self):
+    def copy(self, agents: Optional[List["BaseAgent"]] = None) -> "Task":
         """Create a deep copy of the Task."""
         exclude = {
             "id",
@@ -289,8 +291,12 @@ class Task(BaseModel):
         cloned_context = (
             [task.copy() for task in self.context] if self.context else None
         )
-        cloned_agent = self.agent.copy() if self.agent else None
-        cloned_tools = deepcopy(self.tools) if self.tools else []
+
+        def get_agent_by_role(role: str) -> Union["BaseAgent", None]:
+            return next((agent for agent in agents if agent.role == role), None)
+
+        cloned_agent = get_agent_by_role(self.agent.role) if self.agent else None
+        cloned_tools = copy(self.tools) if self.tools else []
 
         copied_task = Task(
             **copied_data,
@@ -298,68 +304,94 @@ class Task(BaseModel):
             agent=cloned_agent,
             tools=cloned_tools,
         )
+
         return copied_task
 
-    def _export_output(self, result: str) -> Any:
-        exported_result = result
-        instructions = "I'm gonna convert this raw text into valid JSON."
+    def _export_output(
+        self, result: str
+    ) -> Dict[str, Union[BaseModel, Dict[str, Any]]]:
+        output = {
+            "pydantic": None,
+            "json": None,
+        }
 
         if self.output_pydantic or self.output_json:
-            model = self.output_pydantic or self.output_json
+            model_output = self._convert_to_model(result)
+            output["pydantic"] = (
+                model_output if isinstance(model_output, BaseModel) else None
+            )
+            output["json"] = model_output if isinstance(model_output, dict) else None
 
-            # try to convert task_output directly to pydantic/json
+        if self.output_file:
+            self._save_output(output["raw"])
+
+        return output
+
+    def _convert_to_model(self, result: str) -> Union[dict, BaseModel, str]:
+        model = self.output_pydantic or self.output_json
+        try:
+            return self._validate_model(result, model)
+        except Exception:
+            return self._handle_partial_json(result, model)
+
+    def _validate_model(
+        self, result: str, model: Type[BaseModel]
+    ) -> Union[dict, BaseModel]:
+        exported_result = model.model_validate_json(result)
+        if self.output_json:
+            return exported_result.model_dump()
+        return exported_result
+
+    def _handle_partial_json(
+        self, result: str, model: Type[BaseModel]
+    ) -> Union[dict, BaseModel, str]:
+        match = re.search(r"({.*})", result, re.DOTALL)
+        if match:
             try:
-                # type: ignore # Item "None" of "type[BaseModel] | None" has no attribute "model_validate_json"
-                exported_result = model.model_validate_json(result)
+                exported_result = model.model_validate_json(match.group(0))
                 if self.output_json:
-                    # type: ignore # "str" has no attribute "model_dump"
                     return exported_result.model_dump()
                 return exported_result
             except Exception:
-                # sometimes the response contains valid JSON in the middle of text
-                match = re.search(r"({.*})", result, re.DOTALL)
-                if match:
-                    try:
-                        # type: ignore # Item "None" of "type[BaseModel] | None" has no attribute "model_validate_json"
-                        exported_result = model.model_validate_json(match.group(0))
-                        if self.output_json:
-                            # type: ignore # "str" has no attribute "model_dump"
-                            return exported_result.model_dump()
-                        return exported_result
-                    except Exception:
-                        pass
+                pass
 
-            # type: ignore # Item "None" of "Agent | None" has no attribute "function_calling_llm"
-            llm = getattr(self.agent, "function_calling_llm", None) or self.agent.llm
-            if not self._is_gpt(llm):
-                # type: ignore # Argument "model" to "PydanticSchemaParser" has incompatible type "type[BaseModel] | None"; expected "type[BaseModel]"
-                model_schema = PydanticSchemaParser(model=model).get_schema()
-                instructions = f"{instructions}\n\nThe json should have the following structure, with the following keys:\n{model_schema}"
+        return self._convert_with_instructions(result, model)
 
-            converter = self.agent.get_output_converter(
-                llm=llm, text=result, model=model, instructions=instructions
+    def _convert_with_instructions(
+        self, result: str, model: Type[BaseModel]
+    ) -> Union[dict, BaseModel, str]:
+        llm = self.agent.function_calling_llm or self.agent.llm
+        instructions = self._get_conversion_instructions(model, llm)
+
+        converter = Converter(
+            llm=llm, text=result, model=model, instructions=instructions
+        )
+        exported_result = (
+            converter.to_pydantic() if self.output_pydantic else converter.to_json()
+        )
+
+        if isinstance(exported_result, ConverterError):
+            Printer().print(
+                content=f"{exported_result.message} Using raw output instead.",
+                color="red",
             )
-
-            if self.output_pydantic:
-                exported_result = converter.to_pydantic()
-            elif self.output_json:
-                exported_result = converter.to_json()
-
-            if isinstance(exported_result, ConverterError):
-                Printer().print(
-                    content=f"{exported_result.message} Using raw output instead.",
-                    color="red",
-                )
-                exported_result = result
-
-        if self.output_file:
-            content = (
-                # type: ignore # "str" has no attribute "json"
-                exported_result if not self.output_pydantic else exported_result.json()
-            )
-            self._save_file(content)
+            return result
 
         return exported_result
+
+    def _get_conversion_instructions(self, model: Type[BaseModel], llm: Any) -> str:
+        instructions = "I'm gonna convert this raw text into valid JSON."
+        if not self._is_gpt(llm):
+            model_schema = PydanticSchemaParser(model=model).get_schema()
+            instructions = f"{instructions}\n\nThe json should have the following structure, with the following keys:\n{model_schema}"
+        return instructions
+
+    def _save_output(self, content: str) -> None:
+        directory = os.path.dirname(self.output_file)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+        with open(self.output_file, "w", encoding="utf-8") as file:
+            file.write(content)
 
     def _is_gpt(self, llm) -> bool:
         return isinstance(llm, ChatOpenAI) and llm.openai_api_base is None
